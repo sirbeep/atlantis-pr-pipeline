@@ -1,0 +1,208 @@
+#atlantis:
+    nameOverride: atlantis
+    atlantisUrl: https://atlantis.sirbeep.com
+    orgAllowlist: 'github.com/sirbeep/iac-project*'
+    
+    image:
+      repository: REPO
+      tag: TAG
+    ingress:
+      enabled: true
+      host: atlantis.sirbeep.com
+      pathType: Prefix
+      path: /
+      annotations: 
+        alb.ingress.kubernetes.io/aws-load-balancer-ssl-ports: https
+        alb.ingress.kubernetes.io/scheme: internal
+        alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:12345678:certificate/12345678-1234-1234-1234-12345678"
+        alb.ingress.kubernetes.io/healthcheck-path: /
+        alb.ingress.kubernetes.io/success-codes: '200-301'
+        alb.ingress.kubernetes.io/healthcheck-interval-seconds: '6'
+        alb.ingress.kubernetes.io/healthcheck-timeout-seconds: '5'
+        alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=80
+        alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}, {"HTTP":80}]'
+        alb.ingress.kubernetes.io/target-type: ip
+        kubernetes.io/ingress.class: alb
+        alb.ingress.kubernetes.io/ssl-policy: 'ELBSecurityPolicy-TLS13-1-2-2021-06'
+
+      
+    atlantisDataDirectory: /home/atlantis  
+    volumeClaim:
+      enabled: true
+      # -- Disk space available to check out repositories.
+      dataStorage: 5Gi
+      # -- Storage class name (if possible, use a resizable one).
+      storageClassName: ""
+      accessModes: ["ReadWriteOnce"]
+    serviceAccount:
+      # -- Specifies whether a ServiceAccount should be created.
+      create: false
+      # -- Set the `automountServiceAccountToken` field on the pod template spec.
+      # -- If false, no kubernetes service account token will be mounted to the pod.
+      mount: true
+      # -- The name of the ServiceAccount to use.
+      # If not set and create is true, a name is generated using the fullname template.
+      name: atlantis
+      
+    initConfig:
+      enabled: true
+      image: alpine:latest
+      imagePullPolicy: IfNotPresent
+      # sharedDir is set as env var INIT_SHARED_DIR
+      sharedDir: /plugins
+      workDir: /tmp
+      sizeLimit: 250Mi
+      script: |
+        #!/bin/sh
+        set -eoux pipefail
+
+        # terragrunt
+        TG_VERSION="0.55.10"
+        TG_SHA256_SUM="1ad609399352348a41bb5ea96fdff5c7a18ac223742f60603a557a54fc8c6cff"
+        TG_FILE="${INIT_SHARED_DIR}/terragrunt"
+        wget https://github.com/gruntwork-io/terragrunt/releases/download/v${TG_VERSION}/terragrunt_linux_amd64 -O "${TG_FILE}"
+        echo "${TG_SHA256_SUM} ${TG_FILE}" | sha256sum -c
+        chmod 755 "${TG_FILE}"
+        terragrunt -v
+
+        # OpenTofu
+        TF_VERSION="1.6.2"
+        TF_FILE="${INIT_SHARED_DIR}/tofu"
+        wget https://github.com/opentofu/opentofu/releases/download/v${TF_VERSION}/tofu_${TF_VERSION}_linux_amd64.zip
+        unzip tofu_${TF_VERSION}_linux_amd64.zip
+        mv tofu ${INIT_SHARED_DIR}
+        chmod 755 "${TF_FILE}"
+        tofu -v
+        
+        # make both https:// and ssh: git pulls work, various versions of them are in various levels of modules.
+        ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+        
+        
+        # setup automatic environments
+        mkdir -p ${INIT_SHARED_DIR}/products
+        cat > ${INIT_SHARED_DIR}/products/dev.tfvars << "EOF"
+        atlantis_role = "arn:aws:iam::561045881690:role/atlantis-godmode"
+        vpc_id = "vpc-01b536bfafa3aaff2"
+        subnet_id = ["subnet-04c8d96a4c1163a13","subnet-098756071198eb1d9","subnet-0917422cc755d1d88","subnet-0c69f523c7a320a14"]
+        env = "dev"
+        EOF
+        cat > ${INIT_SHARED_DIR}/products/qa.tfvars << "EOF"
+        atlantis_role = "arn:aws:iam::779907190354:role/atlantis-godmode"
+        vpc_id = "vpc-00454fc772b8e3e63"
+        subnet_id = ["subnet-096df1bd5757b1154","subnet-05a83094c52795116","subnet-0610d57ced6a3ef9e","subnet-067214d61cbe0d2ad"]
+        env = "qa"
+        EOF
+        cat > ${INIT_SHARED_DIR}/products/stage.tfvars << "EOF"
+        atlantis_role = "arn:aws:iam::967607805018:role/atlantis-godmode"
+        vpc_id = "vpc-0cfa0ae2cc60884ec"
+        subnet_id = ["subnet-05c2f0b77cdad8f7e","subnet-011217785ef36c277","subnet-00c5fa248adc0086a","subnet-084d9ae754b312e0a"]
+        env = "stage"
+        EOF
+        cat > ${INIT_SHARED_DIR}/products/prod.tfvars << "EOF"
+        atlantis_role = "arn:aws:iam::911550933763:role/atlantis-godmode"
+        vpc_id = "vpc-02abe9ab522b4c81b"
+        subnet_id = ["subnet-056e2f1f08a6bf522","subnet-0d66310008cc973b0","subnet-07088681907f03b3d","subnet-0974fc4f8ae04eee9"]
+        env = "prod"
+        EOF
+        mkdir -p /atlantis
+        chmod 777 /atlantis
+    environment: 
+      ATLANTIS_TF_DOWNLOAD: false
+      TERRAGRUNT_TFPATH: /plugins/tofu
+    loadEnvFromSecrets: [atlantis]
+    gitconfigSecretName: "atlantis-gitconfig"
+    config: |   #pulls atlantis.yaml from ${atlantis.fullname} configmap
+      ---
+      webhooks:
+    repoConfig: |
+      ---
+      repos:
+       - id: "/.*project.*/"
+         apply_requirements: [ approved ]
+         allowed_overrides: [ workflow ]
+       - id: "/aa-frontend-pwa/"
+         apply_requirements: [ approved ]
+         allowed_overrides: [ workflow ]
+       - id: "/.*lambda.*/"
+         #apply_requirements: [ approved ]
+         apply_requirements: [ approved ]
+         allowed_overrides: [ workflow ]
+         pre_workflow_hooks:
+           - run: ./setup_lambda.sh
+      workflows:
+       default: # do nothing
+         plan:
+           steps:
+             - run: echo "not an iac project repo"
+       project:
+         plan:
+           steps:
+             - env: &define-custom-env
+                 name: CUSTOM_ENV
+                 command: 'if [ "${BASE_BRANCH_NAME}" == "master" ]; then echo "prod"; else echo "${BASE_BRANCH_NAME}"; fi; if [! -f ../tf-wf/$CUSTOM_ENV.tfvars ]; then mkdir -p ../tf-wf ; cat ${INIT_SHARED_DIR}/products/$CUSTOM_ENV.tfvars >> ../tf-wf/$CUSTOM_ENV.tfvars ; fi;'
+             #- run: rm -rf .terraform && rm .terraform.lock.hcl
+             - init:
+                 extra_args: [ "-backend-config=../tf-wf/$CUSTOM_ENV.backend" ]
+             - plan:
+                 extra_args: [ "-var-file=../tf-wf/$CUSTOM_ENV.tfvars" ]
+       service:
+         plan:
+           steps:
+             - env: &define-custom-env
+                 name: CUSTOM_ENV
+                 command: 'if [ "${BASE_BRANCH_NAME}" == "master" ]; then echo "prod"; else echo "${BASE_BRANCH_NAME}"; fi; if [! -f ../tf-wf/$CUSTOM_ENV.tfvars ]; then mkdir -p ../tf-wf ; cat ${INIT_SHARED_DIR}/services/$CUSTOM_ENV.tfvars >> ../tf-wf/$CUSTOM_ENV.tfvars ; fi;'
+             #- run: rm -rf .terraform && rm .terraform.lock.hcl
+             - init:
+                 extra_args: [ "-backend-config=../tf-wf/$CUSTOM_ENV.backend" ]
+             - plan:
+                 extra_args: [ "-var-file=../tf-wf/$CUSTOM_ENV.tfvars" ]
+       lambda:
+         plan:
+           steps:
+             - env: &define-custom-env
+                 name: CUSTOM_ENV
+                 command: 'if [ "${BASE_BRANCH_NAME}" == "master" ]; then echo "prod"; else echo "${BASE_BRANCH_NAME}"; fi;'
+             - run: rm -rf .terraform
+             - init:
+                 extra_args: [ "-backend-config=../tf-wf/$CUSTOM_ENV.backend" ]
+             - plan:
+                 extra_args: [ "-var-file=../tf-wf/$CUSTOM_ENV.tfvars" ]
+       tf:
+         plan:
+           steps:
+             - env: &define-custom-env
+                 name: CUSTOM_ENV
+                 command: 'if [ "${BASE_BRANCH_NAME}" == "master" ]; then echo "prod"; else echo "${BASE_BRANCH_NAME}"; fi;'
+             #- run: rm -rf .terraform && rm .terraform.lock.hcl
+             - init:
+                 extra_args: [ "-backend-config=../tf-wf/$CUSTOM_ENV.backend" ]
+             - plan:
+                 extra_args: [ "-var-file=../tf-wf/$CUSTOM_ENV.tfvars" ]
+    service:
+      port: 4141
+      targetPort: 4141
+    statefulSet:
+      labels:
+    podTemplate:
+      labels:
+    aws:
+      credentials:
+    containerSecurityContext:
+      readOnlyRootFilesystem:
+    github:
+      user:
+    basicAuth:
+      username:
+    redis:
+      host:
+    livenessProbe:
+      enabled:
+    readinessProbe:
+      enabled:
+    servicemonitor:
+      enabled:
+    service:
+      annotations:
+    podMonitor:
+      enabled:      
+    

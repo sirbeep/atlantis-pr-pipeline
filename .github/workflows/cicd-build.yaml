@@ -1,0 +1,238 @@
+---
+name: Build Pipeline
+on:
+  push:
+    branches: [develop]
+    paths-ignore:
+      - '.github/workflows/**'
+
+env:
+  ECR_REGISTRY: 12345678.dkr.ecr.us-east-1.amazonaws.com
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        # checks out the repo in preparation for build
+        # values.yaml overrides and such come from the service project
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::12345678dev:role/github-actions-federation
+          aws-region: us-east-1
+
+      - name: login to amazon ecr
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: get state repo
+        uses: actions/checkout@master
+        with:
+          repository: sirbeep/cicd-devex-secured-state
+          ref: dev
+          path: ./deploy-charts
+          token: ${{ secrets.STATE_PAT}}
+
+      ##########################
+      # create the repo if it is needed #
+      ##########################
+      - run: echo ${GITHUB_REPOSITORY}
+
+      - name: Prep ECR repository
+        id: ecr-verify-created
+        uses: int128/create-ecr-repository-action@v1
+        with:
+          repository: ${{ github.repository }}
+          lifecycle-policy: deploy-charts/ecr.lifecycle.json
+          repository-policy: deploy-charts/ecr.repo-policy.json
+
+      - name: build docker image
+        run: docker build -t ${ECR_REGISTRY}/${GITHUB_REPOSITORY}:dev-${GITHUB_SHA} -f Dockerfile .
+
+      - name: push docker images
+        run: docker image push ${ECR_REGISTRY}/${GITHUB_REPOSITORY}:dev-${GITHUB_SHA}
+
+      - name: deploy to dev with updated update to dev state
+        shell: bash
+        run: |
+          function update_state(){
+             {
+              git pull
+              echo "./release git"
+              ./release create-service $(cut -d'/' -f2 <<<"${GITHUB_REPOSITORY}") "${GITHUB_REPOSITORY}" "dev-${GITHUB_SHA}"
+              git add chart
+              git commit -am 'release to dev'
+              git push
+              return 0
+             } || {
+              git reset --hard dev
+              return 1
+             }
+          }
+          git config --global user.email "atlantis@sirbeep.com"
+          git config --global user.name "Actions Pipeline"
+          cd ./deploy-charts
+          pip install ruamel.yaml parse schema fire
+          set -x
+          for i in $(seq 1 5); do [ $i -gt 1 ] && update_state && sleep $(($RANDOM % 15)) && s=0 && break || s=$?; done; (exit $s)
+  signoff:
+    name: QA Signoff
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: stagesignoff
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.STATE_PAT}} # checkout as ss so it triggers the later stages
+          #repository: ${{ github.event.pull_request.head.repo.full_name }}
+          #ref: ${{ github.event.pull_request.head.ref }}
+        # checks out the repo in preparation for build
+
+      - name: Merge to master
+        run: |
+          export REL=""
+          echo $GITHUB_REF_NAME
+          if [ ! $GITHUB_REF_NAME = 'develop' ] ; then
+            export VER=$(cut -d'-' -f2 <<<"$GITHUB_REF_NAME")
+            echo $VER
+            export REL="-$VER"
+            echo $REL
+          fi
+          echo $REL
+          git config --local user.email "atlantis@sirbeep.com"
+          git config --local user.name "Actions Pipeline"
+          git fetch --unshallow
+          git checkout master$REL || git checkout -b master$REL
+          git pull || true
+          git merge --no-ff $GITHUB_SHA -m "QA approved"
+          git push --set-upstream origin master$REL || true
+
+          
+  tagrelease:
+    name: Tag Release
+    needs: signoff
+    runs-on: ubuntu-latest
+    environment:
+      name: tag
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.STATE_PAT}}
+        #ref: 'release'
+
+    - name: calculate Tag
+      id: tag
+      run: |
+        git fetch --tags
+        lasttag=`git tag -l 'v1*' --sort -v:refname | head -n 1`
+        if [ -z "$lasttag" ] ; then lasttag="v1.0.0"; fi
+        subsub=${lasttag#*.*.}
+        echo "tag=${lasttag%.*}.$(($subsub + 1))" >> $GITHUB_OUTPUT
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        #aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        #aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        role-to-assume: arn:aws:iam::12345678:role/github-actions-federation
+        aws-region: us-east-1
+
+    - name: Login to Amazon ECR
+      # prepare credentials to push to ECR deployment artifact repository  step 2
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: retag image for production
+      run: |
+        echo $sha
+        if [ ! -z "$(aws ecr batch-get-image --repository-name "${{github.repository}}" --image-ids imageTag="${{steps.tag.outputs.tag}}" --output json | jq --raw-output --join-output '.images[0].imageManifest')" ] ; then
+          MANIFEST=$(aws ecr batch-get-image --repository-name "${{github.repository}}" --image-ids imageTag="dev-${GITHUB_SHA}" --output json | jq --raw-output --join-output '.images[0].imageManifest')
+          aws ecr put-image --repository-name "${{github.repository}}" --image-tag "${{steps.tag.outputs.tag}}" --image-manifest "$MANIFEST"
+        else
+          echo "this appears to be a rerun"
+        fi
+
+    - name: tag release
+      run: |
+          export REL=""
+          echo $GITHUB_REF_NAME
+          if [ ! $GITHUB_REF_NAME = 'develop' ] ; then
+            export VER=$(cut -d'-' -f2 <<<"$GITHUB_REF_NAME")
+            echo $VER
+            export REL="-$VER"
+            echo $REL
+          fi
+          echo $REL
+          echo ${{steps.tag.outputs.tag}}
+          git config --local user.email "atlantis@sirbeep.com"
+          git config --local user.name "Actions Pipeline"
+          git fetch --unshallow
+          git checkout master$REL || git checkout -b master$REL
+          git pull || true
+          git merge --no-ff $GITHUB_SHA -m "Release tagging"
+          git push --set-upstream origin master$REL
+          git tag ${{steps.tag.outputs.tag}}
+          git push origin ${{steps.tag.outputs.tag}}
+          echo "::notice ::Tagged version ${{steps.tag.outputs.tag}}"
+    outputs:
+      tag: ${{steps.tag.outputs.tag}}
+
+  relasetoprod:
+    name: Release to Prod
+    runs-on: ubuntu-latest
+    needs: tagrelease
+    environment:
+      name: prodrelease
+    steps:
+
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.STATE_PAT}}
+        #ref: 'release'
+
+    - name: get state repo
+      uses: actions/checkout@v4
+      with:
+        repository: sirbeep/cicd-devex-secured-state
+        ref: prod
+        path: ./deploy-charts
+        token: ${{ secrets.STATE_PAT}}
+
+    - name: deploy to prod with updated update to prod state
+      shell: bash
+      run: |
+        function update_state(){
+          {
+            git pull
+            echo "./release git"
+            ./release create-service $(cut -d'/' -f2 <<<"${GITHUB_REPOSITORY}") "${GITHUB_REPOSITORY}" ${{needs.tagrelease.outputs.tag}}
+            git add chart
+            git commit -am 'release to prod'
+            git push
+            return 0
+          } || {
+            git reset --hard prod
+            return 1
+          }
+        }
+        git config --global user.email "atlantis@sirbeep.com"
+        git config --global user.name "Actions Pipeline"
+        cd ./deploy-charts
+        pip install ruamel.yaml parse schema fire
+        set -x
+        for i in $(seq 1 5); do [ $i -gt 1 ] && update_state && sleep $(($RANDOM % 15)) && s=0 && break || s=$?; done; (exit $s)
