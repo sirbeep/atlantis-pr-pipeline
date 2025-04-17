@@ -111,6 +111,7 @@
     environment: 
       ATLANTIS_TF_DOWNLOAD: false
       TERRAGRUNT_TFPATH: /plugins/tofu
+      ATLANTIS_DISABLE_GLOBAL_APPLY_LOCK: true
     loadEnvFromSecrets: [atlantis]
     gitconfigSecretName: "atlantis-gitconfig"
     config: |   #pulls atlantis.yaml from ${atlantis.fullname} configmap
